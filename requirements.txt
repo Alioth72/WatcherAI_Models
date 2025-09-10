@@ -1,0 +1,11 @@
+google-generativeai
+python-dotenv
+opencv-python
+psutil
+vidgear
+twilio
+google-cloud-storage
+ultralytics
+torch
+torchvision
+faiss-cpu
