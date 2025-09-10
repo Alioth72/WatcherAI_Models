@@ -17,7 +17,7 @@ class FrameData:
 print(" Loading anomaly detection models (ResNet50 + SVM)...")
 try:
     feature_extractor = ResNet50(weights='imagenet', include_top=False, pooling='avg', input_shape=(224, 224, 3))
-    svm_path = "svm_model.pkl"
+    svm_path = r"C:\Users\Aaarat\PycharmProjects\SIH_LiveCam\Weights\svm_model.pkl"
     svm_model = joblib.load(svm_path)
     print("Warming up GPU...")
     dummy_input = np.zeros((1, 224, 224, 3), dtype=np.float16)

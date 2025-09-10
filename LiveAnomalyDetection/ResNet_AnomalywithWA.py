@@ -1,4 +1,3 @@
-# === Core Libraries ===
 import cv2
 import time
 import signal
@@ -7,101 +6,150 @@ import os
 import queue
 import base64
 import json
+import requests
 from datetime import datetime
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait
-
-# === VLM, Environment & Messaging Libraries ===
 import google.generativeai as genai
 from dotenv import load_dotenv
-from twilio.rest import Client
-
-# === Your Custom Modules ===
 from Sih_ResNet_Anomaly import process_batch
 from rtspHandler import RTSPFrameCapture
-
-# <<< START: FFmpeg Path Configuration >>>
 try:
     ffmpeg_bin_path = r"E:\ffmpeg-2025-09-08-git-45db6945e9-full_build\bin"
     os.environ['PATH'] = ffmpeg_bin_path + os.pathsep + os.environ.get('PATH', '')
-    print("✅ FFmpeg path configured successfully for this session.")
+    print("FFmpeg path configured successfully for this session.")
 except Exception as e:
-    print(f"❌ Error configuring FFmpeg path: {e}")
-# <<< END: FFmpeg Path Configuration >>>
+    print(f"Error configuring FFmpeg path: {e}")
+def get_env_variable(key):
+    value = os.getenv(key)
+    if value:
+        return value.strip('\'"')
+    return None
 
 
-# === Global Settings ===
-# --- Pipeline Config ---
-executor = ThreadPoolExecutor(max_workers=3)  # Increased workers for VLM + Twilio
+executor = ThreadPoolExecutor(max_workers=3)
 shutdown_event = threading.Event()
-BATCH_SIZE = 100  # Frames per batch for anomaly detection
-TARGET_FPS = 5  # Capture frames per second
+BATCH_SIZE = 100
+TARGET_FPS = 5
 
-# --- VLM Trigger Config ---
-VLM_TRIGGER_INTERVAL = 50  # Trigger VLM for every 50 continuous anomaly frames
-VLM_COOLDOWN_SECONDS = 15  # Wait 15s after a VLM call
-
-# --- Gemini VLM Config ---
-FRAME_INTERVAL_FOR_GEMINI = 10  # Take every 10th frame in a batch for Gemini
+VLM_TRIGGER_INTERVAL = 50
+VLM_COOLDOWN_SECONDS = 15
+FRAME_INTERVAL_FOR_GEMINI = 10
 MODEL_NAME = 'gemini-2.5-flash'
-
-
-# === Twilio & VLM Setup ===
 def setup_gemini():
-    """Loads API key and configures the Gemini model."""
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = get_env_variable("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY not found in .env file.")
     genai.configure(api_key=api_key)
-    # Safety settings can be configured as needed
-    print(f"✅ Gemini Model '{MODEL_NAME}' configured.")
+    print(f"Gemini Model '{MODEL_NAME}' configured.")
     return genai.GenerativeModel(MODEL_NAME)
 
 
-def send_whatsapp_alert(anomaly_data):
-    """Formats and sends a WhatsApp alert using Twilio."""
-    # Load Twilio credentials from .env file
-    account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-    auth_token = os.getenv('TWILIO_AUTH_TOKEN')
-    twilio_number = os.getenv('TWILIO_PHONE_NUMBER')
-    recipient_number = os.getenv('RECIPIENT_PHONE_NUMBER')
+def upload_video_to_meta(video_path):
+    """Uploads a video file to Meta's servers and returns the media ID."""
+    # MODIFIED to use the new helper function
+    access_token = get_env_variable('META_ACCESS_TOKEN')
+    phone_number_id = get_env_variable('WHATSAPP_PHONE_ID')
+    api_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
 
-    if not all([account_sid, auth_token, twilio_number, recipient_number]):
-        print("Twilio credentials not fully configured in .env file. Skipping WhatsApp alert.")
-        return
+    if not all([access_token, phone_number_id]):
+        print("Meta credentials not fully configured in .env. Skipping video upload.")
+        return None
 
     try:
-        client = Client(account_sid, auth_token)
-        desc = anomaly_data.get('anomaly_description', {})
+        with open(video_path, 'rb') as video_file:
+            files = {
+                'file': (os.path.basename(video_path), video_file, 'video/mp4'),
+                'type': (None, 'video/mp4'),
+                'messaging_product': (None, 'whatsapp')
+            }
+            headers = {'Authorization': f'Bearer {access_token}'}
 
-        # Format a clean, readable message
-        message_body = (
-            f"🚨ALERT ALERT !* 🚨\n\n"
-            f"*Summary:* {desc.get('summary', 'N/A')}\n"
-            f"*Confidence:* {desc.get('confidence_level', 'N/A')}\n\n"
-            f"*Details:*\n"
-        )
-        for action in desc.get('involved_persons_actions', []):
-            message_body += f"- {action}\n"
+            response = requests.post(api_url, files=files, headers=headers)
+            response.raise_for_status()
 
-        message_body += f"\n*Timeframe:* {anomaly_data.get('batch_start_timestamp', 'N/A')}"
+            media_id = response.json().get('id')
+            print(f"Video uploaded to Meta. Media ID: {media_id}")
+            return media_id
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to upload video to Meta: {e}")
+        return None
 
-        message = client.messages.create(
-            from_=f'whatsapp:{twilio_number}',
-            body=message_body,
-            to=f'whatsapp:{recipient_number}'
-        )
-        print(f"📲 WhatsApp alert sent successfully! SID: {message.sid}")
-    except Exception as e:
-        print(f"❌ Failed to send WhatsApp alert: {e}")
+
+def send_whatsapp_alert(anomaly_data, media_id):
+    """Sends a WhatsApp alert with a video using the Meta Cloud API."""
+    # MODIFIED to use the new helper function
+    access_token = get_env_variable('META_ACCESS_TOKEN')
+    phone_number_id = get_env_variable('WHATSAPP_PHONE_ID')
+    recipient_number = get_env_variable('RECIPIENT_PHONE_NUMBER')
+    api_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
+
+    if not all([access_token, phone_number_id, recipient_number, media_id]):
+        print("Meta API details not fully configured. Skipping WhatsApp alert.")
+        return
+
+    desc = anomaly_data.get('anomaly_description', {})
+    message_body = (
+        f"🚨 *Anomaly Alert Detected!* 🚨\n\n"
+        f"*Summary:* {desc.get('summary', 'N/A')}\n"
+        f"*Confidence:* {desc.get('confidence_level', 'N/A')}\n\n"
+        f"*Timeframe:* {anomaly_data.get('batch_start_timestamp', 'N/A')}\n"
+    )
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient_number,
+        "type": "video",
+        "video": {
+            "id": media_id,
+            "caption": message_body
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(api_url, json=payload, headers=headers)
+        response.raise_for_status()
+        print(f"WhatsApp alert sent successfully! Response: {response.json()}")
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to send WhatsApp alert: {e}")
+
+
+def save_anomaly_clip(frames):
+    if not frames:
+        return None
+
+    output_dir = "anomaly_clips"
+    os.makedirs(output_dir, exist_ok=True)
+
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    clip_path = os.path.join(output_dir, f"anomaly_clip_{timestamp_str}.mp4")
+    height, width, _ = frames[0].frame.shape
+    out = cv2.VideoWriter(clip_path, cv2.VideoWriter_fourcc(*'mp4v'), TARGET_FPS, (width, height))
+
+    for f_data in frames:
+        out.write(f_data.frame)
+    out.release()
+    print(f"Anomaly clip saved to {clip_path}")
+    return clip_path
 
 
 def analyze_and_alert(frames, model, log_file):
-    """Wrapper to run Gemini analysis and then send a Twilio alert."""
+    """Wrapper to run Gemini analysis, save a video, and then send a WhatsApp alert."""
     print("🔬 Submitting batch for Gemini analysis...")
     anomaly_data = analyze_anomaly_with_gemini(frames, model, log_file)
     if anomaly_data:
-        send_whatsapp_alert(anomaly_data)
+        video_path = save_anomaly_clip(frames)
+        if video_path and os.path.exists(video_path):
+            media_id = upload_video_to_meta(video_path)
+            # IMPORTANT: Wait a few seconds for Meta to process the video
+            time.sleep(50)
+            if media_id:
+                send_whatsapp_alert(anomaly_data, media_id)
+            os.remove(video_path)  # Clean up the local video file
 
 
 def analyze_anomaly_with_gemini(frames, model, log_file):
@@ -183,13 +231,13 @@ def run_pipeline(source, gemini_model, log_file, is_rtsp=False):
     else:
         capture = cv2.VideoCapture(source)
         if not capture.isOpened():
-            print(f"❌ Unable to open video: {source}")
+            print(f"Unable to open video: {source}")
             return
         # <<< START: Frame Skipping Logic >>>
         input_fps = capture.get(cv2.CAP_PROP_FPS)
         frame_skip = max(1, int(input_fps / TARGET_FPS))
         print(
-            f"📹 Video file detected. Input FPS: {input_fps:.2f}. Processing 1 frame every {frame_skip} frames to achieve ~{TARGET_FPS} FPS.")
+            f"Video file detected. Input FPS: {input_fps:.2f}. Processing 1 frame every {frame_skip} frames to achieve ~{TARGET_FPS} FPS.")
         frame_count = 0
         # <<< END: Frame Skipping Logic >>>
 
@@ -242,7 +290,7 @@ def run_pipeline(source, gemini_model, log_file, is_rtsp=False):
                     last_vlm_trigger_frame_count = consecutive_anomaly_frames
                     vlm_cooldown_until = time.time() + VLM_COOLDOWN_SECONDS
                     print(
-                        f"⏱️ VLM triggered. Cooldown until {datetime.fromtimestamp(vlm_cooldown_until).strftime('%H:%M:%S')}")
+                        f"⏱ VLM triggered. Cooldown until {datetime.fromtimestamp(vlm_cooldown_until).strftime('%H:%M:%S')}")
 
     except KeyboardInterrupt:
         print("\nStopped by user.")
@@ -251,10 +299,10 @@ def run_pipeline(source, gemini_model, log_file, is_rtsp=False):
             capture.stop()
         else:
             capture.release()
-        print("⏳ Waiting for all background tasks to finish...")
+        print(" Waiting for all background tasks to finish...")
         wait(futures)
         executor.shutdown(wait=True)
-        print("✅ Pipeline shutdown complete.")
+        print(" Pipeline shutdown complete.")
 
 
 def main():
@@ -262,12 +310,12 @@ def main():
     try:
         gemini_model = setup_gemini()
     except ValueError as e:
-        print(f"❌ {e}")
+        print(f" {e}")
         return
 
     timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_file = f"forensic_log_{timestamp_str}.jsonl"
-    print(f"📝 VLM analysis will be logged to: {log_file}")
+    print(f" VLM analysis will be logged to: {log_file}")
 
     print("\nChoose Input Source:")
     print("1. RTSP Stream\n2. Video File")
